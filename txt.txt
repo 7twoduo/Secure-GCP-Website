@@ -1,0 +1,600 @@
+This was a backup while I was making some changes.
+
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "7.33.0"
+    }
+  }
+}
+
+provider "google" {
+  project = "gcp-mastery-495919"
+  region  = "asia-northeast1"
+}
+
+#########################################################
+#                VPC Network
+#########################################################
+
+# Create the Custom VPC Network
+resource "google_compute_network" "silent-killer" {
+  name                    = "lizzo-secret-cookies-vpc"
+  auto_create_subnetworks = false
+}
+# Public Subnets
+resource "google_compute_subnetwork" "public-subnet-1" {
+  name          = "my-public-subnet-1"
+  ip_cidr_range = "10.10.1.0/24"
+  network       = google_compute_network.silent-killer.id
+}
+
+resource "google_compute_subnetwork" "public-subnet-2" {
+  name          = "my-public-subnet-2"
+  ip_cidr_range = "10.10.2.0/24"
+
+  network = google_compute_network.silent-killer.id
+}
+
+# Private Subnets
+
+resource "google_compute_subnetwork" "private-subnet-1" {
+  name          = "my-private-subnet-1"
+  ip_cidr_range = "10.10.11.0/24"
+
+  network = google_compute_network.silent-killer.id
+}
+
+resource "google_compute_subnetwork" "private-subnet-2" {
+  name          = "my-private-subnet-2"
+  ip_cidr_range = "10.10.12.0/24"
+
+  network = google_compute_network.silent-killer.id
+}
+# Firewall Rules
+# Just an SG for AWS
+# 2. Add the Firewall Rule to ONLY allow GCP Load Balancers
+locals {
+  backend_tag = "web-backend"
+}
+
+# Firewall Rules
+# Just an SG for AWS
+# 2. Add the Firewall Rule to ONLY allow GCP Load Balancers
+resource "google_compute_firewall" "allow_internal" {
+  name      = "allow-lb-to-web-backend"
+  network   = google_compute_network.silent-killer.id
+  direction = "INGRESS"
+  priority  = 1000
+
+  source_ranges = [
+    "35.191.0.0/16",
+    "130.211.0.0/22"
+  ]
+
+  target_tags = [local.backend_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+}
+
+# Allow direct public HTTP access to VM public IPs
+resource "google_compute_firewall" "allow_public_http_to_instances" {
+  name      = "allow-public-http-to-instances"
+  network   = google_compute_network.silent-killer.id
+  direction = "INGRESS"
+  priority  = 1100
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = [local.backend_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+}
+
+# Allow VM instances to reach the internet
+resource "google_compute_firewall" "allow_egress_internet" {
+  name      = "allow-egress-internet"
+  network   = google_compute_network.silent-killer.id
+  direction = "EGRESS"
+  priority  = 1000
+
+  destination_ranges = ["0.0.0.0/0"]
+  target_tags        = [local.backend_tag]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443"]
+  }
+
+  allow {
+    protocol = "udp"
+    ports    = ["53"]
+  }
+
+  allow {
+    protocol = "tcp"
+    ports    = ["53"]
+  }
+}
+
+
+#####################################################
+#               Compute Engine
+#####################################################
+
+
+resource "google_service_account" "default" {
+  account_id   = "yellow-mellow"
+  display_name = "EC2 Service Account"
+}
+
+
+resource "google_compute_instance_template" "default" {
+  name_prefix = "appserver-template-"
+  description = "This template is used to create app server instances."
+
+  tags = [local.backend_tag]
+
+  instance_description = "Japanese Stateful App"
+  machine_type         = "e2-medium"
+  can_ip_forward       = false
+
+  scheduling {
+    automatic_restart   = true
+    on_host_maintenance = "MIGRATE"
+  }
+
+  disk {
+    source_image = data.google_compute_image.my_image.self_link
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = 10
+    disk_type    = "pd-balanced"
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.public-subnet-1.id
+
+    # Gives each VM an ephemeral public IPv4 address
+    access_config {
+      network_tier = "PREMIUM"
+    }
+  }
+
+  metadata_startup_script = file("${path.module}/startup.sh")
+
+  service_account {
+    # Google recommends custom service accounts that have cloud-platform scope and permissions granted via IAM Roles.
+    email  = google_service_account.default.email
+    scopes = ["cloud-platform"]
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+
+
+#          Instance Disk
+# IN GCP, there is a lot more to this than AWS
+
+data "google_compute_image" "my_image" {
+  family  = "debian-11"
+  project = "debian-cloud"
+}
+
+# resource "google_compute_disk" "foobar" {
+#   name  = "existing-disk"
+#   image = data.google_compute_image.my_image.self_link
+#   size  = 10
+#   type  = "pd-ssd"
+#   zone  = "asia-northeast1-a"
+# }
+
+# Managed Instance Group (MIG): Manages the collection of virtual machines
+resource "google_compute_instance_group_manager" "default" {
+  name               = "snakes-secret-group"
+  base_instance_name = "web-app"
+  zone               = "asia-northeast1-a"
+
+  version {
+    instance_template = google_compute_instance_template.default.id
+  }
+
+  named_port {
+    name = "http"
+    port = 80
+  }
+}
+
+###  AutoScaler that creates the instances
+
+resource "google_compute_autoscaler" "default" {
+  name   = "web-autoscaler"
+  zone   = "asia-northeast1-a"
+  target = google_compute_instance_group_manager.default.id
+
+  autoscaling_policy {
+    max_replicas    = 5
+    min_replicas    = 2
+    cooldown_period = 60
+
+    cpu_utilization {
+      target = 0.6 # Scale up if average CPU utilization exceeds 60%
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################
+#               Load Balancer
+#########################################################
+
+
+# 1. Reserve a Global Static External IP Address
+resource "google_compute_global_address" "default" {
+  name = "load-balancer-ip"
+}
+
+# 2. Define the Health Check for the Backends
+resource "google_compute_health_check" "default" {
+  name               = "lb-health-check"
+  timeout_sec        = 3
+  check_interval_sec = 3
+
+  http_health_check {
+    port         = 80
+    request_path = "/"
+  }
+}
+
+# # 3. Create the Backend Service
+# resource "google_compute_backend_service" "default" {
+#   name                  = "lizzo-monster"
+#   protocol              = "HTTP"
+#   port_name             = "http"
+#   load_balancing_scheme = "EXTERNAL_MANAGED"
+#   timeout_sec           = 10
+
+#   health_checks = [google_compute_health_check.default.id]
+
+#   # Attach your existing Instance Group or Network Endpoint Group here
+#    backend {
+#     group           = google_compute_instance_group_manager.default.instance_group
+#     balancing_mode  = "UTILIZATION"
+#     capacity_scaler = 1.0
+#   }
+# }
+
+# 4. Create the URL Map (Routing Table)
+resource "google_compute_url_map" "default" {
+  name            = "lb-url-map"
+  default_service = google_compute_backend_service.default.id
+}
+
+# 5. Create the Target HTTP Proxy
+# resource "google_compute_target_http_proxy" "default" {
+#   name    = "lb-target-proxy"
+#   url_map = google_compute_url_map.default.id
+# }
+
+# 6. Create the Global Forwarding Rule (Frontend Entry Point)
+# resource "google_compute_global_forwarding_rule" "default" {
+#   name                  = "lb-forwarding-rule"
+#   ip_protocol           = "TCP"
+#   load_balancing_scheme = "EXTERNAL_MANAGED"
+#   port_range            = "80"
+#   target                = google_compute_target_http_proxy.default.id
+#   ip_address            = google_compute_global_address.default.id
+# }
+
+###############################################################
+#                    HTTPS Level Traffic
+###############################################################
+# 1. Create a Google-Managed SSL Certificate for your domain
+resource "google_compute_managed_ssl_certificate" "default" {
+  name = "lb-ssl-cert"
+
+  managed {
+    domains = ["unshieldedhero.com"] # 👈 Replace with your actual domain
+  }
+}
+
+# 2. Create a Target HTTPS Proxy (replaces target_http_proxy)
+resource "google_compute_target_https_proxy" "default" {
+  name             = "lb-target-https-proxy"
+  url_map          = google_compute_url_map.default.id
+  ssl_certificates = [google_compute_managed_ssl_certificate.default.id]
+}
+
+# 3. Update the Global Forwarding Rule to listen on Port 443
+resource "google_compute_global_forwarding_rule" "https" {
+  name                  = "lb-https-forwarding-rule"
+  ip_protocol           = "TCP"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  port_range            = "443" # 👈 Secure traffic entry point
+  target                = google_compute_target_https_proxy.default.id
+  ip_address            = google_compute_global_address.default.id
+}
+
+
+####         CDN: Content Delivery Network
+
+# 3. Create the Backend Service and Enable CDN
+resource "google_compute_backend_service" "default" {
+  name                  = "lizzo-monster"
+  protocol              = "HTTP"
+  port_name             = "http"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  timeout_sec           = 10
+
+  health_checks = [google_compute_health_check.default.id]
+  # This enables CDN for the backend service, which is a lot easier than AWS
+  enable_cdn = true
+  cdn_policy {
+    cache_mode  = "CACHE_ALL_STATIC"
+    client_ttl  = 3600
+    default_ttl = 3600
+    max_ttl     = 86400
+
+    cache_key_policy {
+      include_host         = true
+      include_protocol     = true
+      include_query_string = false
+    }
+  }
+
+  # 4. Associate the WAF Security Policy with the Backend Service
+  # This is essentially the WAF For the system, it is a lot different from AWS
+  security_policy = google_compute_security_policy.waf_policy.id
+
+  # Attach your existing Instance Group or Network Endpoint Group here
+  backend {
+    group           = google_compute_instance_group_manager.default.instance_group
+    balancing_mode  = "UTILIZATION"
+    capacity_scaler = 1.0
+  }
+}
+
+####        WAF: Web Application Firewall
+# ==========================================
+# CLOUD ARMOR WAF SECURITY POLICY
+# ==========================================
+
+resource "google_compute_security_policy" "waf_policy" {
+  name        = "unshieldedhero-waf-policy"
+  description = "Cloud Armor WAF policy for unshieldedhero.com"
+  type        = "CLOUD_ARMOR"
+}
+# For a Public Website
+resource "google_compute_security_policy_rule" "default_allow" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 2147483647
+  description     = "Default allow rule"
+  action          = "allow"
+
+  match {
+    versioned_expr = "SRC_IPS_V1"
+
+    config {
+      src_ip_ranges = ["*"]
+    }
+  }
+}
+# Block Scanners
+resource "google_compute_security_policy_rule" "block_scanners" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 1000
+  description     = "Block scanner detection signatures"
+  action          = "deny(403)"
+
+  match {
+    expr {
+      expression = "evaluatePreconfiguredWaf('scannerdetection-v422-stable', {'sensitivity': 1})"
+    }
+  }
+}
+#Block SQL Injection
+resource "google_compute_security_policy_rule" "block_sqli" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 1100
+  description     = "Block SQL injection attempts"
+  action          = "deny(403)"
+
+  match {
+    expr {
+      expression = "evaluatePreconfiguredWaf('sqli-v422-stable', {'sensitivity': 1})"
+    }
+  }
+}
+# Block XSS Attacks
+resource "google_compute_security_policy_rule" "block_xss" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 1200
+  description     = "Block cross-site scripting attempts"
+  action          = "deny(403)"
+
+  match {
+    expr {
+      expression = "evaluatePreconfiguredWaf('xss-v422-stable', {'sensitivity': 1})"
+    }
+  }
+}
+# Block LFI Attacks
+resource "google_compute_security_policy_rule" "block_lfi" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 1300
+  description     = "Block local file inclusion attempts"
+  action          = "deny(403)"
+
+  match {
+    expr {
+      expression = "evaluatePreconfiguredWaf('lfi-v422-stable', {'sensitivity': 1})"
+    }
+  }
+}
+# Block RFI Attacks
+resource "google_compute_security_policy_rule" "block_rfi" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 1400
+  description     = "Block remote file inclusion attempts"
+  action          = "deny(403)"
+
+  match {
+    expr {
+      expression = "evaluatePreconfiguredWaf('rfi-v422-stable', {'sensitivity': 1})"
+    }
+  }
+}
+# Block RCE Attacks
+resource "google_compute_security_policy_rule" "block_rce" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 1500
+  description     = "Block remote code execution attempts"
+  action          = "deny(403)"
+
+  match {
+    expr {
+      expression = "evaluatePreconfiguredWaf('rce-v422-stable', {'sensitivity': 1})"
+    }
+  }
+}
+# Block Protocol Attacks
+resource "google_compute_security_policy_rule" "block_protocol_attacks" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 1600
+  description     = "Block protocol attack signatures"
+  action          = "deny(403)"
+
+  match {
+    expr {
+      expression = "evaluatePreconfiguredWaf('protocolattack-v422-stable', {'sensitivity': 1})"
+    }
+  }
+}
+# Rate Limiting Ban
+resource "google_compute_security_policy_rule" "rate_limit_per_ip" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 2000
+  description     = "Rate limit requests per source IP"
+  action          = "rate_based_ban"
+
+  match {
+    versioned_expr = "SRC_IPS_V1"
+
+    config {
+      src_ip_ranges = ["*"]
+    }
+  }
+
+  rate_limit_options {
+    conform_action = "allow"
+    exceed_action  = "deny(429)"
+    enforce_on_key = "IP"
+
+    rate_limit_threshold {
+      count        = 120
+      interval_sec = 60
+    }
+
+    ban_duration_sec = 300
+
+    ban_threshold {
+      count        = 500
+      interval_sec = 300
+    }
+  }
+}
+# Block High Risk Countries
+resource "google_compute_security_policy_rule" "block_high_risk_countries" {
+  security_policy = google_compute_security_policy.waf_policy.name
+  priority        = 3000
+  description     = "Block selected country traffic"
+  action          = "deny(403)"
+
+  match {
+    expr {
+      expression = <<-EOT
+        origin.region_code == 'RU' ||
+        origin.region_code == 'CN' ||
+        origin.region_code == 'KP' ||
+        origin.region_code == 'IR'
+      EOT
+    }
+  }
+}
+
+####        Domain A record to my backend : unshieldedhero.com
+locals {
+  project_id = "gcp-mastery-495919"
+  domain     = "unshieldedhero.com"
+  zone_name  = "unshieldedhero-zone"
+}
+
+resource "google_dns_managed_zone" "main" {
+  name        = local.zone_name
+  dns_name    = "${local.domain}."
+  description = "Public DNS zone for ${local.domain}"
+  visibility  = "public"
+
+  labels = {
+    environment = "dev"
+    project     = "unshieldedhero"
+  }
+}
+
+resource "google_dns_record_set" "root" {
+  name         = "${local.domain}."
+  managed_zone = google_dns_managed_zone.main.name
+  type         = "A"
+  ttl          = 300
+
+  rrdatas = [
+    google_compute_global_address.default.address
+  ]
+}
+
+resource "google_dns_record_set" "www" {
+  name         = "www.${local.domain}."
+  managed_zone = google_dns_managed_zone.main.name
+  type         = "A"
+  ttl          = 300
+
+  rrdatas = [
+    google_compute_global_address.default.address
+  ]
+}
+output "cloud_dns_name_servers" {
+  description = "Name servers that must be configured at the domain registrar"
+  value       = google_dns_managed_zone.main.name_servers
+}
+
+output "root_domain" {
+  value = local.domain
+}
+
+output "www_domain" {
+  value = "www.${local.domain}"
+}
+
+output "lb_ip_address" {
+  value = google_compute_global_address.default.address
+}
