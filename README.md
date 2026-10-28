@@ -1,4 +1,4 @@
-# 🌌 Event Horizon — Secure GCP Global Web Platform
+# Secure-GCP-Website
 
 <p align="center">
   <img src="https://readme-typing-svg.demolab.com?font=Inter&weight=700&size=24&pause=1200&color=4285F4&center=true&vCenter=true&width=1050&lines=Secure+Global+Web+Delivery+on+Google+Cloud;Private+Compute+Engine+Backends+Behind+HTTPS+Load+Balancing;Terraform+%2B+Cloud+Armor+%2B+Cloud+CDN+%2B+KMS+%2B+Monitoring" alt="Typing SVG" />
